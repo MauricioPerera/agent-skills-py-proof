@@ -506,8 +506,14 @@ def list_skills(root: Path) -> list[IndexedSkill]:
                 embedding=d["embedding"],
                 embedding_model=d["embedding_model"],
             ))
-        except Exception:
-            continue  # corrupt entry, skip (SPEC §4.5 partial-failure resilience)
+        except (OSError, json.JSONDecodeError, KeyError):
+            # Per-entry corruption is non-fatal (SPEC §4.5 partial-failure
+            # resilience). We catch ONLY the three classes of legitimate
+            # corruption: filesystem read failures, malformed JSON, and
+            # missing required fields. KeyboardInterrupt / MemoryError /
+            # other system signals propagate so the operator can stop the
+            # process cleanly.
+            continue
     return out
 
 
