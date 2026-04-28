@@ -1,6 +1,6 @@
 # `agent-skills-py-proof`
 
-A minimal Python implementation of the [agent-skills v0.2 specification](https://github.com/MauricioPerera/agent-skills/blob/main/SPEC.md). **Sole purpose: empirically prove the spec is sufficient for a second, independent implementation.**
+A minimal Python implementation of the [agent-skills v0.3 specification](https://github.com/MauricioPerera/agent-skills/blob/main/SPEC.md). **Sole purpose: empirically prove the spec is sufficient for a second, independent implementation.**
 
 This is **not** a general-purpose Python skill bank. It implements a deliberately small subset (parse, sync, query, bench) — enough to validate the retrieval contract end-to-end. Exec, audit, rerank, signing, and author tooling are **out of scope** here; they live in the [reference TypeScript CLI](https://github.com/MauricioPerera/agent-skills-cli).
 
@@ -14,7 +14,7 @@ This repo refutes that risk with a single experiment:
 
 **Result**: bit-for-bit identical retrieval scores, identical bench accuracy, identical failure mode.
 
-| Metric | TS CLI ([`agent-skills-cli`](https://github.com/MauricioPerera/agent-skills-cli) v0.11.0) | Python (`bank.py` in this repo) |
+| Metric | TS CLI ([`agent-skills-cli`](https://github.com/MauricioPerera/agent-skills-cli) v0.13.1) | Python (`bank.py` in this repo) |
 |---|---:|---:|
 | Top-1 accuracy | 34/35 (97.1 %) | **34/35 (97.1 %)** ✓ |
 | Top-3 accuracy | 35/35 (100 %) | **35/35 (100 %)** ✓ |
@@ -45,7 +45,7 @@ What this does **not** rule out (out of scope, but worth flagging):
 
 ## What's in `bank.py`
 
-A single ~600-line file (~720 with comments and blank lines) with three subcommands. Standard library + `pyyaml` + `requests`.
+A single file (~767 lines including doc-comments + blank lines, ~600 LOC of executable code) with three subcommands. Standard library + `pyyaml` + `requests`.
 
 Implemented sections of the spec:
 
@@ -128,7 +128,7 @@ If you want to write a third implementation — Rust, Go, Java, Common Lisp — 
 
 1. The spec ([SPEC.md](https://github.com/MauricioPerera/agent-skills/blob/main/SPEC.md)) as the contract.
 2. The TS CLI as a comprehensive, production-grade reference.
-3. **This Python file as a 510-line reading list** that demonstrates which spec sections matter for retrieval, in what order, and with what numerical guarantees.
+3. **This Python file as a single-file reading list** that demonstrates which spec sections matter for retrieval + signature verification, in what order, and with what numerical guarantees.
 
 If your implementation produces different scores on the same setup, **either you're doing something different or you've found a gap in the spec**. Either way, that's actionable.
 
@@ -142,6 +142,6 @@ The bit-identical retrieval claim is not a one-shot snapshot — it's continuous
 
 ## Sister projects
 
-- [`agent-skills`](https://github.com/MauricioPerera/agent-skills) — canonical specification (v0.2.0).
-- [`agent-skills-cli`](https://github.com/MauricioPerera/agent-skills-cli) — reference TypeScript CLI (v0.11.0).
-- [`agent-skills-pack`](https://github.com/MauricioPerera/agent-skills-pack) — example skill pack with `bench-truth.jsonl`.
+- [`agent-skills`](https://github.com/MauricioPerera/agent-skills) — canonical specification (v0.3.0).
+- [`agent-skills-cli`](https://github.com/MauricioPerera/agent-skills-cli) — reference TypeScript CLI (v0.13.1).
+- [`agent-skills-pack`](https://github.com/MauricioPerera/agent-skills-pack) — example skill pack (v1.1.0) with `bench-truth.jsonl`.
