@@ -214,10 +214,34 @@ def compose_embedding_text(fm: dict[str, Any]) -> str:
 #                  whether to treat as failure or as "no signal"
 
 
+def detect_signature_method(signature: str | None) -> str | None:
+    """Mirror of TS detectSignatureMethod (v0.14.0+).
+
+    Structural detection of the signing method by PEM header:
+      "-----BEGIN PGP SIGNATURE-----"  → "gpg"
+      "-----BEGIN SIGNED MESSAGE-----" → "sigstore" (gitsign / Fulcio)
+
+    Returns None for unrecognised / missing payloads. This is detection,
+    NOT verification — the trust verdict still comes from the host's
+    'verified' field.
+    """
+    if not signature:
+        return None
+    if "-----BEGIN PGP SIGNATURE-----" in signature:
+        return "gpg"
+    if "-----BEGIN SIGNED MESSAGE-----" in signature:
+        return "sigstore"
+    return None
+
+
 def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
     """Mirror SPEC §5.1 Level 3a verification via GitHub's API.
 
-    Returns: {"status": <SignatureStatus>, "reason": str, "signed_by": str?}
+    Returns: {"status": <SignatureStatus>, "reason": str, "signed_by"?: str,
+              "method"?: "gpg" | "sigstore"}
+    The "method" field (v0.14.0+) is structural detection of which crypto
+    system signed the tag. Full Sigstore Level 4 (Rekor inclusion proof
+    verification) is queued for v0.15+.
     """
     if not repo.startswith("github.com/"):
         return {"status": "unverified",
@@ -264,8 +288,12 @@ def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
         return out
 
     reason = verification.get("reason", "unknown")
+    method = detect_signature_method(verification.get("signature"))
+
     if verification.get("verified") is True:
         out.update({"status": "valid", "reason": reason})
+        if method is not None:
+            out["method"] = method
         return out
 
     # verified=false. Distinguish "no signature attempted" from "signature present
@@ -274,6 +302,8 @@ def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
         out.update({"status": "unsigned", "reason": reason})
         return out
     out.update({"status": "invalid", "reason": reason})
+    if method is not None:
+        out["method"] = method
     return out
 
 
@@ -438,6 +468,8 @@ def cmd_sync(source: str, embedder: Embedder, root: Path,
         }
         if signature.get("signed_by"):
             provenance["signed_by"] = signature["signed_by"]
+        if signature.get("method"):
+            provenance["signature_method"] = signature["method"]
         record = {
             "identity": identity,
             "short_id": sid,
