@@ -37,6 +37,7 @@ Dependencies: pyyaml, requests. (Python ≥ 3.10.)
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -241,14 +242,216 @@ def detect_signature_method(signature: str | None) -> str | None:
     return None
 
 
+# ────────────────────────────────────────────────────────────────────
+# Sigstore identity extraction (parity with TS CLI cms.ts, v0.16.0+)
+# ────────────────────────────────────────────────────────────────────
+# A "sigstore"-method tag carries a CMS SignedData blob whose first cert is
+# the Fulcio-issued ephemeral signing cert. Its SAN carries the OIDC subject
+# (email or workflow URI) and Fulcio extension OID 1.3.6.1.4.1.57264.1.1
+# (or .1.8) carries the OIDC issuer. Together they answer "who signed this?".
+# We hand-roll just enough ASN.1 to walk to those fields — no new deps.
+# Cross-impl parity with the TS CLI is validated continuously via the e2e
+# workflow (compares .signature.identity between implementations).
+
+_PEM_CMS_OPEN = "-----BEGIN SIGNED MESSAGE-----"
+_PEM_CMS_CLOSE = "-----END SIGNED MESSAGE-----"
+_FULCIO_OIDC_ISSUER_OID_V1 = "1.3.6.1.4.1.57264.1.1"
+_FULCIO_OIDC_ISSUER_OID_V2 = "1.3.6.1.4.1.57264.1.8"
+_X509_SAN_EXT_OID = "2.5.29.17"
+
+
+def _read_tlv(buf: bytes, off: int) -> tuple[int, int, int, int]:
+    """Read one DER TLV. Returns (tag, value_off, value_len, total_len)."""
+    if off + 2 > len(buf):
+        raise ValueError("ASN.1 truncated at TLV header")
+    tag = buf[off]
+    p = off + 1
+    length = buf[p]
+    p += 1
+    if length & 0x80:
+        n = length & 0x7F
+        if n == 0:
+            raise ValueError("ASN.1 indefinite length not supported")
+        if n > 4:
+            raise ValueError(f"ASN.1 length-of-length {n} unreasonable")
+        if p + n > len(buf):
+            raise ValueError("ASN.1 truncated in length bytes")
+        length = 0
+        for _ in range(n):
+            length = (length << 8) | buf[p]
+            p += 1
+    if p + length > len(buf):
+        raise ValueError("ASN.1 declared length exceeds buffer")
+    return tag, p, length, (p - off + length)
+
+
+def _decode_oid(buf: bytes) -> str:
+    if not buf:
+        return ""
+    out = [str(buf[0] // 40), str(buf[0] % 40)]
+    v = 0
+    for b in buf[1:]:
+        v = (v << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            out.append(str(v))
+            v = 0
+    return ".".join(out)
+
+
+def _extract_first_cert_der(pem_signature: str) -> bytes | None:
+    """Walk CMS SignedData to extract the first cert's DER bytes."""
+    start = pem_signature.find(_PEM_CMS_OPEN)
+    if start < 0:
+        return None
+    end = pem_signature.find(_PEM_CMS_CLOSE, start + len(_PEM_CMS_OPEN))
+    if end < 0:
+        return None
+    b64 = re.sub(r"\s+", "", pem_signature[start + len(_PEM_CMS_OPEN):end])
+    try:
+        der = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if not der:
+        return None
+    try:
+        # ContentInfo SEQUENCE -> skip OID -> [0] EXPLICIT -> SignedData
+        ci_tag, ci_voff, ci_vlen, _ = _read_tlv(der, 0)
+        if ci_tag != 0x30:
+            return None
+        off = ci_voff
+        _, _, _, oid_total = _read_tlv(der, off)
+        off += oid_total
+        ex_tag, ex_voff, _, _ = _read_tlv(der, off)
+        if ex_tag != 0xA0:
+            return None
+        sd_tag, sd_voff, sd_vlen, _ = _read_tlv(der, ex_voff)
+        if sd_tag != 0x30:
+            return None
+        # Walk SignedData children for [0] IMPLICIT certificates (tag 0xa0).
+        p = sd_voff
+        sd_end = sd_voff + sd_vlen
+        cert_set = None
+        while p < sd_end:
+            t_tag, t_voff, t_vlen, t_total = _read_tlv(der, p)
+            if t_tag == 0xA0:
+                cert_set = (t_voff, t_vlen)
+                break
+            p += t_total
+        if cert_set is None:
+            return None
+        # First cert SEQUENCE inside the set.
+        c_tag, _, _, c_total = _read_tlv(der, cert_set[0])
+        if c_tag != 0x30:
+            return None
+        return der[cert_set[0]:cert_set[0] + c_total]
+    except Exception:
+        return None
+
+
+def _walk_cert_extensions(cert_der: bytes):
+    """Yield (oid_str, octet_string_value_bytes) for each extension."""
+    cert_tag, cert_voff, _, _ = _read_tlv(cert_der, 0)
+    tbs_tag, tbs_voff, tbs_vlen, _ = _read_tlv(cert_der, cert_voff)
+    p = tbs_voff
+    tbs_end = tbs_voff + tbs_vlen
+    ext_outer = None
+    while p < tbs_end:
+        t_tag, t_voff, t_vlen, t_total = _read_tlv(cert_der, p)
+        if t_tag == 0xA3:  # [3] EXPLICIT extensions
+            ext_outer = (t_voff, t_vlen)
+            break
+        p += t_total
+    if ext_outer is None:
+        return
+    seq_tag, seq_voff, seq_vlen, _ = _read_tlv(cert_der, ext_outer[0])
+    if seq_tag != 0x30:
+        return
+    ep = seq_voff
+    e_end = seq_voff + seq_vlen
+    while ep < e_end:
+        ext_tag, ext_voff, _, ext_total = _read_tlv(cert_der, ep)
+        ip = ext_voff
+        oid_tag, oid_voff, oid_vlen, oid_total = _read_tlv(cert_der, ip)
+        oid = _decode_oid(cert_der[oid_voff:oid_voff + oid_vlen])
+        ip += oid_total
+        v_tag, v_voff, v_vlen, v_total = _read_tlv(cert_der, ip)
+        if v_tag == 0x01:  # optional critical BOOLEAN
+            ip += v_total
+            v_tag, v_voff, v_vlen, _ = _read_tlv(cert_der, ip)
+        if v_tag == 0x04:  # OCTET STRING
+            yield oid, cert_der[v_voff:v_voff + v_vlen]
+        ep += ext_total
+
+
+def _parse_san(san_octet_value: bytes) -> tuple[str, str] | None:
+    """Parse the SAN extension's OCTET STRING contents.
+    Returns (subject, subject_type) for the first entry."""
+    try:
+        seq_tag, seq_voff, seq_vlen, _ = _read_tlv(san_octet_value, 0)
+        if seq_tag != 0x30:
+            return None
+        # First GeneralName entry — context-specific tag (0x80 | choice).
+        gn_tag, gn_voff, gn_vlen, _ = _read_tlv(san_octet_value, seq_voff)
+        value = san_octet_value[gn_voff:gn_voff + gn_vlen].decode("utf-8", errors="replace")
+        if gn_tag == 0x81:  # rfc822Name
+            return value, "email"
+        if gn_tag == 0x86:  # uniformResourceIdentifier
+            return value, "uri"
+        return value, "other"
+    except Exception:
+        return None
+
+
+def extract_sigstore_identity(pem_signature: str | None) -> dict[str, str] | None:
+    """Top-level: extract Sigstore identity claim from a CMS payload.
+
+    Returns {"subject", "subject_type", "issuer"?} or None on missing /
+    malformed input. Mirrors TS extractSigstoreIdentity (cms.ts).
+
+    IMPORTANT: extraction != verification. The returned identity is the
+    cert's *claimed* identity; verifying against Rekor is Level 4 work.
+    """
+    if not pem_signature:
+        return None
+    cert_der = _extract_first_cert_der(pem_signature)
+    if not cert_der:
+        return None
+
+    subject = subject_type = issuer = None
+    for oid, value in _walk_cert_extensions(cert_der):
+        if oid == _X509_SAN_EXT_OID and subject is None:
+            parsed = _parse_san(value)
+            if parsed:
+                subject, subject_type = parsed
+        elif oid in (_FULCIO_OIDC_ISSUER_OID_V1, _FULCIO_OIDC_ISSUER_OID_V2) and issuer is None:
+            # V1: bare UTF-8 in the OCTET STRING. V2: UTF-8String DER (tag 0x0c).
+            if oid == _FULCIO_OIDC_ISSUER_OID_V2 and len(value) > 0 and value[0] == 0x0C:
+                try:
+                    _, voff, vlen, _ = _read_tlv(value, 0)
+                    issuer = value[voff:voff + vlen].decode("utf-8", errors="replace")
+                except Exception:
+                    issuer = value.decode("utf-8", errors="replace")
+            else:
+                issuer = value.decode("utf-8", errors="replace")
+
+    if subject is None:
+        return None
+    out: dict[str, str] = {"subject": subject, "subject_type": subject_type or "other"}
+    if issuer is not None:
+        out["issuer"] = issuer
+    return out
+
+
 def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
     """Mirror SPEC §5.1 Level 3a verification via GitHub's API.
 
     Returns: {"status": <SignatureStatus>, "reason": str, "signed_by"?: str,
-              "method"?: "gpg" | "sigstore"}
+              "method"?: "gpg" | "ssh" | "sigstore",
+              "identity"?: {"subject", "subject_type", "issuer"?}}
     The "method" field (v0.14.0+) is structural detection of which crypto
-    system signed the tag. Full Sigstore Level 4 (Rekor inclusion proof
-    verification) is queued for v0.15+.
+    system signed the tag. The "identity" field (v0.16.0+) is extracted
+    from the CMS for sigstore-method tags. Full Sigstore Level 4 (Rekor
+    inclusion-proof verification) remains queued.
     """
     if not repo.startswith("github.com/"):
         return {"status": "unverified",
@@ -296,11 +499,16 @@ def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
 
     reason = verification.get("reason", "unknown")
     method = detect_signature_method(verification.get("signature"))
+    # For sigstore-method tags, attempt CMS identity extraction (v0.16.0+).
+    identity = (extract_sigstore_identity(verification.get("signature"))
+                if method == "sigstore" else None)
 
     if verification.get("verified") is True:
         out.update({"status": "valid", "reason": reason})
         if method is not None:
             out["method"] = method
+        if identity is not None:
+            out["identity"] = identity
         return out
 
     # verified=false. Distinguish "no signature attempted" from "signature present
@@ -311,6 +519,8 @@ def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
     out.update({"status": "invalid", "reason": reason})
     if method is not None:
         out["method"] = method
+    if identity is not None:
+        out["identity"] = identity
     return out
 
 
