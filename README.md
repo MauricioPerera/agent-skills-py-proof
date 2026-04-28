@@ -45,19 +45,23 @@ What this does **not** rule out (out of scope, but worth flagging):
 
 ## What's in `bank.py`
 
-A single ~510-line file (627 with comments and blank lines) with three subcommands and four pure functions. Standard library + `pyyaml` + `requests`.
+A single ~600-line file (~720 with comments and blank lines) with three subcommands. Standard library + `pyyaml` + `requests`.
 
 Implemented sections of the spec:
 
 | Section | What it covers | LOC |
 |---|---|---:|
 | §2.1 + §2.2 | SKILL.md frontmatter parse + required-field validation | ~30 |
+| §2.5 | Provenance fields (computed at ingest, not author-declared) | ~10 |
 | §3.2 | `skills-index.json` consumption | ~20 |
 | §4.2 | Embedding-text composition (`title . use_when . description . examples[].intent . tags`) | ~15 |
 | §4.3 | Pure cosine retrieval (no rerank, no filter) | ~15 |
 | §4.6 | JSONL/JSON-array truth-file parsing + bench accuracy reporting | ~80 |
 | §4.7 | Embedding provider abstraction (Ollama only) — name + dim + embed | ~40 |
+| **§5.1 Level 3a** | **Host-verified GPG (GitHub API) — always observe + `--verify-signature` enforces** | **~80** |
 | §7.1 | Sync: GitHub ref → SHA → jsDelivr CDN → embed → store | ~80 |
+
+The `signature_status` enumeration (`"valid" | "invalid" | "unsigned" | "unverified"`) is implemented exactly per SPEC §5.1 — `"unverified"` is **not** equivalent to `"valid"` and indicates the bank could not perform verification (non-supported host, lightweight tag, raw SHA, etc.).
 
 Out of scope here (see SPEC for the contracts):
 
@@ -65,7 +69,8 @@ Out of scope here (see SPEC for the contracts):
 - §4.3.1 — rerank patterns (orthogonal)
 - §4.4 — execution contract (`exec`-only)
 - §4.5 — audit log (`exec`-only)
-- §5.x — signature verification
+- §5.1 Level 3b — client-verified GPG (`trusted_keys` allowlist)
+- Level 4 — Sigstore + Rekor
 
 ## Try it
 
@@ -79,6 +84,11 @@ cd agent-skills-py-proof
 
 # Sync the public pack (~85 s — Ollama embedding is the bottleneck)
 python bank.py sync github.com/MauricioPerera/agent-skills-pack@main
+
+# Or, with signature enforcement (SPEC §5.1 Level 3a). Aborts cleanly
+# without any embedding API calls if the tag isn't GPG-verified by GitHub:
+python bank.py sync github.com/MauricioPerera/agent-skills-pack@v1.1.0 --verify-signature
+# → signature verification failed: status=unsigned (tagger: ...)
 
 # Single query
 python bank.py query "fetch the contents of a URL"

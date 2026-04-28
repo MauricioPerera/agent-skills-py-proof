@@ -193,6 +193,104 @@ def compose_embedding_text(fm: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Signature verification (SPEC §5.1 Level 3a — host-verified)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# v0.2 of the spec splits Level 3 (signed tags) into 3a (host-verified —
+# the bank trusts the host's GPG verification API) and 3b (client-verified —
+# the bank verifies locally against `trusted_keys`). This proof implements
+# 3a only, mirroring the reference TS CLI v0.10.0. 3b would require a local
+# GPG keyring and is properly the next iteration.
+#
+# The verifier returns one of four statuses, exactly per SPEC §5.1:
+#   "valid"      — host returned verified=true
+#   "invalid"    — verified=false but a signature is present (unknown_key,
+#                  bad_email, expired, etc.) — active red flag
+#   "unsigned"   — verified=false and no signature payload (annotated tag
+#                  but no GPG signature, OR lightweight tag with no tag
+#                  object) — sloppy publisher hygiene, not malicious
+#   "unverified" — bank could not perform verification (non-GitHub host,
+#                  raw SHA ref, API rate limit, etc.) — caller decides
+#                  whether to treat as failure or as "no signal"
+
+
+def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
+    """Mirror SPEC §5.1 Level 3a verification via GitHub's API.
+
+    Returns: {"status": <SignatureStatus>, "reason": str, "signed_by": str?}
+    """
+    if not repo.startswith("github.com/"):
+        return {"status": "unverified",
+                "reason": f"host '{repo}' not supported by GPG verifier yet"}
+    if re.match(r"^[a-f0-9]{40,}$", ref):
+        return {"status": "unverified",
+                "reason": "ref is a raw commit hash; no tag-level signature to verify"}
+
+    owner_repo = repo[len("github.com/"):]
+    headers = {"Accept": "application/vnd.github+json"}
+
+    # 1. Resolve tag → tag-object SHA (annotated tag) or commit SHA (lightweight)
+    ref_url = f"https://api.github.com/repos/{owner_repo}/git/refs/tags/{urllib.parse.quote(ref)}"
+    r = requests.get(ref_url, headers=headers, timeout=30)
+    if r.status_code == 404:
+        return {"status": "unverified", "reason": f"tag '{ref}' not found via GitHub API"}
+    if not r.ok:
+        return {"status": "unverified",
+                "reason": f"GitHub API returned {r.status_code} {r.reason}"}
+    obj = r.json().get("object") or {}
+    if obj.get("type") == "commit":
+        return {"status": "unsigned",
+                "reason": "lightweight tag (annotated tag required for tag-signing)"}
+    if obj.get("type") != "tag" or not isinstance(obj.get("sha"), str):
+        return {"status": "unverified", "reason": "unexpected ref shape (no tag object)"}
+
+    # 2. Fetch tag object + verification block
+    tag_url = f"https://api.github.com/repos/{owner_repo}/git/tags/{obj['sha']}"
+    r = requests.get(tag_url, headers=headers, timeout=30)
+    if not r.ok:
+        return {"status": "unverified",
+                "reason": f"tag-object fetch returned {r.status_code} {r.reason}"}
+    tag = r.json()
+    tagger = tag.get("tagger") or {}
+    name = tagger.get("name") or ""
+    email = tagger.get("email") or ""
+    signed_by = (f"{name} <{email}>" if name and email
+                 else (f"<{email}>" if email else (name or None)))
+    out: dict[str, Any] = {"signed_by": signed_by} if signed_by else {}
+
+    verification = tag.get("verification")
+    if not isinstance(verification, dict):
+        out.update({"status": "unverified", "reason": "GitHub returned no verification block"})
+        return out
+
+    reason = verification.get("reason", "unknown")
+    if verification.get("verified") is True:
+        out.update({"status": "valid", "reason": reason})
+        return out
+
+    # verified=false. Distinguish "no signature attempted" from "signature present
+    # but couldn't be verified" — operators care about the difference.
+    if reason == "unsigned" or verification.get("signature") in (None, ""):
+        out.update({"status": "unsigned", "reason": reason})
+        return out
+    out.update({"status": "invalid", "reason": reason})
+    return out
+
+
+def enforce_verification(result: dict[str, Any], repo: str, ref: str) -> None:
+    """Raise RuntimeError if status != 'valid'. Used when --verify-signature is set."""
+    if result.get("status") == "valid":
+        return
+    detail = (f" (tagger: {result['signed_by']}, reason: {result['reason']})"
+              if result.get("signed_by") else f" (reason: {result.get('reason', 'unknown')})")
+    raise RuntimeError(
+        f"signature verification failed for {repo}@{ref}: status={result.get('status')}{detail}. "
+        f"Pass without --verify-signature to ingest unverified, or work with the publisher to "
+        f"sign their tag with 'git tag -s' and re-tag.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Sync (SPEC §7 — resolve ref → SHA → fetch index → fetch skills → embed)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -249,9 +347,18 @@ class IndexedSkill:
     skill_md: str = ""  # raw source for round-trip
 
 
-def cmd_sync(source: str, embedder: Embedder, root: Path) -> dict[str, Any]:
+def cmd_sync(source: str, embedder: Embedder, root: Path,
+             verify_signature: bool = False) -> dict[str, Any]:
     repo, ref_requested = parse_source_spec(source)
     sha = resolve_ref(repo, ref_requested)
+
+    # SPEC §5.1: always observe; optionally enforce. Status is recorded in
+    # provenance regardless. With verify_signature=True, anything other
+    # than "valid" aborts BEFORE any embedding API call (operators don't
+    # pay for a sync that we're going to refuse to ingest).
+    signature = verify_github_tag(repo, ref_requested)
+    if verify_signature:
+        enforce_verification(signature, repo, ref_requested)
 
     index_url = cdn_url(repo, sha, "skills-index.json")
     r = requests.get(index_url, timeout=30)
@@ -320,6 +427,17 @@ def cmd_sync(source: str, embedder: Embedder, root: Path) -> dict[str, Any]:
             continue
 
         identity = f"{repo}@{sha}/{sid}"
+        # Provenance per SPEC §2.5 — populated at ingest time, not author-declared.
+        provenance = {
+            "source_type": "git",
+            "source": repo,
+            "ref_resolved_to": sha,
+            "ref_requested": ref_requested,
+            "fetched_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            "signature_status": signature["status"],
+        }
+        if signature.get("signed_by"):
+            provenance["signed_by"] = signature["signed_by"]
         record = {
             "identity": identity,
             "short_id": sid,
@@ -329,6 +447,7 @@ def cmd_sync(source: str, embedder: Embedder, root: Path) -> dict[str, Any]:
             "embedding": vec,
             "embedding_model": embedder.name,
             "frontmatter": fm,
+            "provenance": provenance,
         }
         # Filename: hash of identity (matches the TS CLI's behaviour conceptually,
         # but we don't need byte compatibility — only the spec-level contract).
@@ -348,18 +467,23 @@ def cmd_sync(source: str, embedder: Embedder, root: Path) -> dict[str, Any]:
         "invalid": sum(1 for r in results if r["status"] == "invalid"),
         "errored": sum(1 for r in results if r["status"] == "error"),
         "skills": results,
+        "signature": signature,
+        "signature_enforced": verify_signature and signature.get("status") == "valid",
     }
 
     # Persist subscription record so update / re-sync would work
     subs_path = root / "subscriptions.json"
     subs = json.loads(subs_path.read_text()) if subs_path.exists() else []
     subs = [s for s in subs if s.get("id") != source]
-    subs.append({
+    sub: dict[str, Any] = {
         "id": source,
         "repo": repo,
         "ref_requested": ref_requested,
         "ref_resolved": sha,
-    })
+    }
+    if verify_signature:
+        sub["verify_signature"] = True
+    subs.append(sub)
     subs_path.write_text(json.dumps(subs, indent=2), encoding="utf-8")
 
     return summary
@@ -553,6 +677,8 @@ def main() -> int:
 
     p_sync = sub.add_parser("sync", help="fetch + embed + index a pack")
     p_sync.add_argument("source", help="<host>/<owner>/<repo>[@<ref>]")
+    p_sync.add_argument("--verify-signature", action="store_true",
+                        help="abort if the resolved tag isn't GPG-verified by the host (SPEC §5.1 Level 3a)")
 
     p_query = sub.add_parser("query", help="embed intent + cosine search")
     p_query.add_argument("intent")
@@ -568,7 +694,8 @@ def main() -> int:
     embedder = Embedder.ollama()
 
     if args.cmd == "sync":
-        result = cmd_sync(args.source, embedder, root)
+        result = cmd_sync(args.source, embedder, root,
+                          verify_signature=args.verify_signature)
     elif args.cmd == "query":
         result = cmd_query(args.intent, args.k, embedder, root)
     elif args.cmd == "bench":
@@ -592,6 +719,13 @@ def _print_human(cmd: str, r: dict[str, Any]) -> None:
     if cmd == "sync":
         print(f"Synced {r['source']}")
         print(f"  ref: {r['ref_requested']} -> {r['ref_resolved']}")
+        sig = r.get("signature") or {}
+        if sig:
+            glyph = "[ok]" if sig.get("status") == "valid" else (
+                "[invalid]" if sig.get("status") == "invalid" else "[..]")
+            enforced = " (enforced)" if r.get("signature_enforced") else ""
+            by = f" -- {sig['signed_by']}" if sig.get("signed_by") else ""
+            print(f"  signature: {glyph} {sig.get('status')}{enforced} ({sig.get('reason')}){by}")
         print(f"  total: {r['total']} | synced: {r['synced']} | invalid: {r['invalid']} | errored: {r['errored']}")
         for s in r["skills"]:
             icon = "[ok]" if s["status"] == "synced" else ("[invalid]" if s["status"] == "invalid" else "[err]")
