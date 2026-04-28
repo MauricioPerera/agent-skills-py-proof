@@ -215,20 +215,27 @@ def compose_embedding_text(fm: dict[str, Any]) -> str:
 
 
 def detect_signature_method(signature: str | None) -> str | None:
-    """Mirror of TS detectSignatureMethod (v0.14.0+).
+    """Mirror of TS detectSignatureMethod (v0.14.0+, "ssh" added v0.15.0).
 
     Structural detection of the signing method by PEM header:
-      "-----BEGIN PGP SIGNATURE-----"  → "gpg"
-      "-----BEGIN SIGNED MESSAGE-----" → "sigstore" (gitsign / Fulcio)
+      "-----BEGIN PGP SIGNATURE-----"  -> "gpg"
+      "-----BEGIN SSH SIGNATURE-----"  -> "ssh"      (git's gpg.format=ssh)
+      "-----BEGIN SIGNED MESSAGE-----" -> "sigstore" (gitsign / Fulcio)
 
     Returns None for unrecognised / missing payloads. This is detection,
-    NOT verification — the trust verdict still comes from the host's
+    NOT verification - the trust verdict still comes from the host's
     'verified' field.
+
+    For Sigstore, see SPEC v0.3.2 sigstore-on-host trap: a 'bad_cert'
+    verdict on a 'sigstore'-method tag is ambiguous (Fulcio cert may have
+    expired post-sign), not equivalent to a forged signature.
     """
     if not signature:
         return None
     if "-----BEGIN PGP SIGNATURE-----" in signature:
         return "gpg"
+    if "-----BEGIN SSH SIGNATURE-----" in signature:
+        return "ssh"
     if "-----BEGIN SIGNED MESSAGE-----" in signature:
         return "sigstore"
     return None
