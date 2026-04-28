@@ -126,6 +126,10 @@ If your implementation produces different scores on the same setup, **either you
 
 [MIT](./LICENSE) — copy-paste, fork, port. The point is more implementations.
 
+## Continuously validated parity
+
+The bit-identical retrieval claim is not a one-shot snapshot — it's continuously checked. [`agent-skills-cli`'s `e2e.yml` workflow](https://github.com/MauricioPerera/agent-skills-cli/actions/workflows/e2e.yml) runs both implementations on the same setup (Ollama `all-minilm` against `agent-skills-pack@main`) on every push and weekly via cron, and **fails the build if the numerical results diverge**. So this README's claim ages well: any silent drift between the two implementations gets caught within 7 days.
+
 ## Sister projects
 
 - [`agent-skills`](https://github.com/MauricioPerera/agent-skills) — canonical specification (v0.2.0).
