@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""agent-skills bank — minimal Python implementation, proof that spec v0.2
+is sufficient for a second implementation.
+
+What's in scope (per the spec the reference CLI also implements):
+  - SKILL.md parse + validate (subset of SPEC §2.2 required fields)
+  - sync (resolve ref → SHA via GitHub API, fetch skills-index.json + each
+    SKILL.md from jsDelivr CDN, embed each, store)
+  - query (embed intent, cosine over indexed skills, return top-K)
+  - bench (run a JSONL/JSON-array truth file, report top-K accuracy)
+
+What's deliberately out of scope (orthogonal to retrieval validation):
+  - exec (subprocess + audit log)
+  - rerank (intent-conditional / global) — pure cosine is enough for proof
+  - signature verification
+  - init / publish (author tooling)
+
+Embedding provider: Ollama (local, zero credentials), per spec §4.7.
+Default model: embeddinggemma (768-dim) — same model used in the
+reference CLI's live BENCHMARK numbers.
+
+Goal: run bench against agent-skills-pack@main + bench-truth.jsonl and
+confirm top-K accuracy is within tolerance of the reference CLI's numbers
+(34/35 top-1, 35/35 top-3 on Ollama embeddinggemma). If yes → spec v0.2
+demonstrably supports an independent implementation.
+
+Usage:
+    python bank.py sync github.com/MauricioPerera/agent-skills-pack@main
+    python bank.py query "fetch the contents of a URL"
+    python bank.py bench bench-truth.jsonl
+
+Bank state is at ~/.config/agent-skills-py/ (XDG-style), separate from the
+TS CLI's bank to avoid interference.
+
+Dependencies: pyyaml, requests. (Python ≥ 3.10.)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import urllib.parse
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import requests
+import yaml
+
+# ─────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "embeddinggemma")
+# Known dimensions; spec §4.7 requires the bank to record (name, dim) pairs.
+KNOWN_DIMS: dict[str, int] = {
+    "embeddinggemma": 768,
+    "embeddinggemma:latest": 768,
+    "nomic-embed-text": 768,
+    "nomic-embed-text:latest": 768,
+    "mxbai-embed-large": 1024,
+    "all-minilm": 384,
+    "bge-m3": 1024,
+}
+
+REQUIRED_FIELDS = {"schema_version", "id", "version", "title", "description",
+                   "use_when", "command_template"}
+
+
+def bank_root() -> Path:
+    """Default bank root, separate from the TS CLI's bank to avoid interference."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "agent-skills-py"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SKILL.md parsing + validation (SPEC §2.1, §2.2)
+# ─────────────────────────────────────────────────────────────────────────
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
+
+
+def parse_skill_md(source: str) -> tuple[dict[str, Any], str]:
+    """Split a SKILL.md into (frontmatter dict, body str). Per SPEC §2.1.
+
+    Raises ValueError on malformed input.
+    """
+    m = _FRONTMATTER_RE.match(source)
+    if not m:
+        raise ValueError("SKILL.md is missing YAML frontmatter delimited by ---")
+    fm_text, body = m.groups()
+    try:
+        fm = yaml.safe_load(fm_text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"frontmatter YAML parse error: {e}") from None
+    if not isinstance(fm, dict):
+        raise ValueError("frontmatter must be a YAML mapping")
+    return fm, body
+
+
+def validate_skill(fm: dict[str, Any]) -> list[str]:
+    """Return list of validation errors. Empty list = valid. Subset of SPEC §2.2."""
+    errors: list[str] = []
+    for f in REQUIRED_FIELDS:
+        if f not in fm:
+            errors.append(f"missing required field: {f}")
+    if "id" in fm and not re.match(r"^[a-zA-Z0-9_-]+$", str(fm["id"])):
+        errors.append("id must match ^[a-zA-Z0-9_-]+$")
+    return errors
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Embedding provider: Ollama (SPEC §4.7 — name + dim + embed triplet)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Embedder:
+    name: str
+    dim: int
+    base_url: str
+
+    @classmethod
+    def ollama(cls, base_url: str = OLLAMA_BASE_URL,
+               model: str = OLLAMA_MODEL) -> "Embedder":
+        dim = KNOWN_DIMS.get(model)
+        if dim is None:
+            # Probe by sending one embed call; cheaper than asking the user.
+            r = requests.post(
+                f"{base_url.rstrip('/')}/api/embed",
+                json={"model": model, "input": "probe"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            dim = len(r.json()["embeddings"][0])
+        return cls(name=f"ollama:{model}", dim=dim, base_url=base_url.rstrip("/"))
+
+    def embed(self, text: str) -> list[float]:
+        if not text:
+            raise ValueError("cannot embed empty text")
+        # Extract model name from "ollama:<model>"
+        model = self.name.split(":", 1)[1] if ":" in self.name else self.name
+        r = requests.post(
+            f"{self.base_url}/api/embed",
+            json={"model": model, "input": text},
+            timeout=60,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Ollama returned {r.status_code}: {r.text[:200]}")
+        vec = r.json()["embeddings"][0]
+        if len(vec) != self.dim:
+            raise RuntimeError(
+                f"Ollama returned {len(vec)}-dim vector; expected {self.dim}",
+            )
+        return vec
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    """SPEC-compliant cosine similarity over equal-length vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
+
+
+def compose_embedding_text(fm: dict[str, Any]) -> str:
+    """Per SPEC §4.2: title . use_when . description . examples[].intent . tags
+
+    Joined by '. ' (period + space). The reference CLI uses this exact
+    composition; aligning here is what makes vectors comparable across
+    implementations of the same model.
+    """
+    parts: list[str] = [
+        str(fm.get("title", "")),
+        str(fm.get("use_when", "")),
+        str(fm.get("description", "")),
+    ]
+    examples = fm.get("examples")
+    if isinstance(examples, list) and examples:
+        intents = [str(e.get("intent", "")) for e in examples
+                   if isinstance(e, dict)]
+        if intents:
+            parts.append("\n".join(intents))
+    tags = fm.get("tags")
+    if isinstance(tags, list) and tags:
+        parts.append(" ".join(str(t) for t in tags))
+    return ". ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sync (SPEC §7 — resolve ref → SHA → fetch index → fetch skills → embed)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def parse_source_spec(source: str) -> tuple[str, str]:
+    """`<host>/<owner>/<repo>[@<ref>]` → (repo, ref). Default ref = main."""
+    if "@" in source:
+        repo, ref = source.split("@", 1)
+        return repo, ref
+    return source, "main"
+
+
+def resolve_ref(repo: str, ref: str) -> str:
+    """Tag/branch/commit → 40+hex SHA via GitHub API. Per SPEC §7.1."""
+    if re.match(r"^[a-f0-9]{40,}$", ref):
+        return ref
+    if not repo.startswith("github.com/"):
+        raise ValueError(
+            f"non-GitHub host '{repo}' not supported by this proof-of-concept",
+        )
+    owner_repo = repo[len("github.com/"):]
+    candidates = [
+        f"https://api.github.com/repos/{owner_repo}/git/refs/tags/{urllib.parse.quote(ref)}",
+        f"https://api.github.com/repos/{owner_repo}/commits/{urllib.parse.quote(ref)}",
+    ]
+    headers = {"Accept": "application/vnd.github+json"}
+    for url in candidates:
+        r = requests.get(url, headers=headers, timeout=30)
+        if not r.ok:
+            continue
+        data = r.json()
+        sha = data.get("object", {}).get("sha") if isinstance(data.get("object"), dict) else data.get("sha")
+        if isinstance(sha, str) and re.match(r"^[a-f0-9]{40,}$", sha):
+            return sha
+    raise RuntimeError(f"cannot resolve ref '{ref}' for {repo}")
+
+
+def cdn_url(repo: str, sha: str, path: str) -> str:
+    if not repo.startswith("github.com/"):
+        raise ValueError(f"unsupported host: {repo}")
+    owner_repo = repo[len("github.com/"):]
+    return f"https://cdn.jsdelivr.net/gh/{owner_repo}@{sha}/{path}"
+
+
+@dataclass
+class IndexedSkill:
+    identity: str
+    short_id: str
+    title: str
+    use_when: str
+    description: str
+    embedding: list[float]
+    embedding_model: str
+    skill_md: str = ""  # raw source for round-trip
+
+
+def cmd_sync(source: str, embedder: Embedder, root: Path) -> dict[str, Any]:
+    repo, ref_requested = parse_source_spec(source)
+    sha = resolve_ref(repo, ref_requested)
+
+    index_url = cdn_url(repo, sha, "skills-index.json")
+    r = requests.get(index_url, timeout=30)
+    r.raise_for_status()
+    index = r.json()
+    skills_idx = index.get("skills") or []
+    if not isinstance(skills_idx, list):
+        raise RuntimeError(f"skills-index.json missing 'skills' array")
+
+    # Initialize / verify bank metadata (SPEC §4.7 — refuse model mix).
+    root.mkdir(parents=True, exist_ok=True)
+    meta_path = root / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("embedding_model") != embedder.name:
+            raise RuntimeError(
+                f"bank already initialized with '{meta['embedding_model']}'; "
+                f"refusing to mix with '{embedder.name}'. Delete {root} to start over.",
+            )
+    else:
+        meta_path.write_text(
+            json.dumps({
+                "schema_version": "0.1",
+                "embedding_model": embedder.name,
+                "embedding_dim": embedder.dim,
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+    skills_dir = root / "skills"
+    skills_dir.mkdir(exist_ok=True)
+    results = []
+
+    for entry in skills_idx:
+        sid = entry["id"]
+        # Per SPEC §3.2: skill URL via entry.url OR url_template.
+        url = entry.get("url")
+        if not url:
+            tpl = index.get("url_template")
+            if not tpl:
+                results.append({"id": sid, "status": "error",
+                                "message": "no url + no url_template"})
+                continue
+            url = tpl.replace("{ref}", sha).replace("{path}", sid)
+
+        try:
+            sr = requests.get(url, timeout=30)
+            sr.raise_for_status()
+            src = sr.text
+            fm, _body = parse_skill_md(src)
+            errs = validate_skill(fm)
+            if errs:
+                results.append({"id": sid, "status": "invalid", "errors": errs})
+                continue
+        except Exception as e:
+            results.append({"id": sid, "status": "error", "message": str(e)})
+            continue
+
+        # Embed per SPEC §4.2 composition
+        emb_text = compose_embedding_text(fm)
+        try:
+            vec = embedder.embed(emb_text)
+        except Exception as e:
+            results.append({"id": sid, "status": "error",
+                            "message": f"embedding failed: {e}"})
+            continue
+
+        identity = f"{repo}@{sha}/{sid}"
+        record = {
+            "identity": identity,
+            "short_id": sid,
+            "title": fm["title"],
+            "use_when": fm["use_when"],
+            "description": fm["description"],
+            "embedding": vec,
+            "embedding_model": embedder.name,
+            "frontmatter": fm,
+        }
+        # Filename: hash of identity (matches the TS CLI's behaviour conceptually,
+        # but we don't need byte compatibility — only the spec-level contract).
+        import hashlib
+        fn = hashlib.sha256(identity.encode()).hexdigest()[:16] + ".json"
+        (skills_dir / fn).write_text(
+            json.dumps(record, indent=2), encoding="utf-8",
+        )
+        results.append({"id": sid, "identity": identity, "status": "synced"})
+
+    summary = {
+        "source": source,
+        "ref_requested": ref_requested,
+        "ref_resolved": sha,
+        "total": len(results),
+        "synced": sum(1 for r in results if r["status"] == "synced"),
+        "invalid": sum(1 for r in results if r["status"] == "invalid"),
+        "errored": sum(1 for r in results if r["status"] == "error"),
+        "skills": results,
+    }
+
+    # Persist subscription record so update / re-sync would work
+    subs_path = root / "subscriptions.json"
+    subs = json.loads(subs_path.read_text()) if subs_path.exists() else []
+    subs = [s for s in subs if s.get("id") != source]
+    subs.append({
+        "id": source,
+        "repo": repo,
+        "ref_requested": ref_requested,
+        "ref_resolved": sha,
+    })
+    subs_path.write_text(json.dumps(subs, indent=2), encoding="utf-8")
+
+    return summary
+
+
+def list_skills(root: Path) -> list[IndexedSkill]:
+    skills_dir = root / "skills"
+    if not skills_dir.exists():
+        return []
+    out: list[IndexedSkill] = []
+    for p in sorted(skills_dir.glob("*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            out.append(IndexedSkill(
+                identity=d["identity"],
+                short_id=d["short_id"],
+                title=d["title"],
+                use_when=d["use_when"],
+                description=d["description"],
+                embedding=d["embedding"],
+                embedding_model=d["embedding_model"],
+            ))
+        except Exception:
+            continue  # corrupt entry, skip (SPEC §4.5 partial-failure resilience)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Query (SPEC §4.3 — pure cosine, no rerank, no filter)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def cmd_query(intent: str, k: int, embedder: Embedder, root: Path) -> dict[str, Any]:
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    if meta["embedding_model"] != embedder.name:
+        raise RuntimeError(
+            f"embedding model mismatch: bank uses '{meta['embedding_model']}', "
+            f"query is using '{embedder.name}'",
+        )
+    qvec = embedder.embed(intent)
+    skills = list_skills(root)
+    scored = [(cosine(qvec, s.embedding), s) for s in skills]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = scored[:k]
+    return {
+        "intent": intent,
+        "embedding_model": embedder.name,
+        "hits": [
+            {
+                "identity": s.identity,
+                "short_id": s.short_id,
+                "title": s.title,
+                "use_when": s.use_when,
+                "score": round(score, 4),
+            }
+            for score, s in top
+        ],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Bench (SPEC §4.6 — JSONL or JSON-array truth file)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def parse_truth_file(text: str, path: str) -> list[dict[str, str]]:
+    """Auto-detect JSONL vs JSON-array per SPEC §4.6."""
+    stripped = text.lstrip()
+    if not stripped:
+        raise ValueError(f"{path}: empty truth file")
+    raw: list[Any]
+    if stripped[0] == "[":
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}: invalid JSON: {e}") from None
+        if not isinstance(raw, list):
+            raise ValueError(f"{path}: top-level JSON value is not an array")
+    else:
+        raw = []
+        for i, line in enumerate(text.split("\n"), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                raw.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{i}: invalid JSON: {e}") from None
+
+    out: list[dict[str, str]] = []
+    for i, e in enumerate(raw, start=1):
+        if not isinstance(e, dict):
+            raise ValueError(f"{path} entry #{i}: expected object")
+        intent = e.get("intent")
+        expected = e.get("expected")
+        if not isinstance(intent, str) or not intent:
+            raise ValueError(f"{path} entry #{i}: missing/empty 'intent'")
+        if not isinstance(expected, str) or not expected:
+            raise ValueError(f"{path} entry #{i}: missing/empty 'expected'")
+        out.append({"intent": intent, "expected": expected})
+    return out
+
+
+def cmd_bench(truth_file: str, k: int, embedder: Embedder, root: Path) -> dict[str, Any]:
+    text = Path(truth_file).read_text(encoding="utf-8")
+    entries = parse_truth_file(text, truth_file)
+
+    skills = list_skills(root)
+    by_short_id: dict[str, list[IndexedSkill]] = {}
+    for s in skills:
+        by_short_id.setdefault(s.short_id, []).append(s)
+
+    # Validate truth file: every expected MUST resolve to exactly one skill
+    # (SPEC §4.6 — fail-fast contract).
+    for e in entries:
+        ms = by_short_id.get(e["expected"], [])
+        if not ms:
+            raise RuntimeError(f"truth file references unknown skill: {e['expected']}")
+        if len(ms) > 1:
+            raise RuntimeError(f"ambiguous expected '{e['expected']}': {len(ms)} matches")
+
+    queries: list[dict[str, Any]] = []
+    top1 = top3 = topk = 0
+    total_top1_score = total_margin = 0.0
+
+    for e in entries:
+        expected_identity = by_short_id[e["expected"]][0].identity
+        qvec = embedder.embed(e["intent"])
+        scored = [(cosine(qvec, s.embedding), s) for s in skills]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        top = scored[:max(k + 1, 10)]
+
+        rank = None
+        expected_score = None
+        for i, (score, s) in enumerate(top[:k], start=1):
+            if s.identity == expected_identity:
+                rank = i
+                expected_score = score
+                break
+        top1_score = top[0][0]
+        margin = top1_score - (top[1][0] if len(top) > 1 else 0.0)
+
+        if rank == 1:
+            top1 += 1
+        if rank is not None and rank <= 3:
+            top3 += 1
+        if rank is not None:
+            topk += 1
+
+        total_top1_score += top1_score
+        total_margin += margin
+
+        queries.append({
+            "intent": e["intent"],
+            "expected": e["expected"],
+            "rank": rank,
+            "got_top1": top[0][1].short_id,
+            "top1_score": round(top1_score, 4),
+            "expected_score": None if expected_score is None else round(expected_score, 4),
+            "margin": round(margin, 4),
+        })
+
+    return {
+        "truth_file": truth_file,
+        "embedding_model": embedder.name,
+        "total": len(entries),
+        "top1": top1,
+        "top3": top3,
+        "topK": topk,
+        "k": k,
+        "mean_top1_score": round(total_top1_score / max(len(entries), 1), 4),
+        "mean_margin": round(total_margin / max(len(entries), 1), 4),
+        "queries": queries,
+        "failures": [q for q in queries if q["rank"] != 1],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="bank.py",
+        description="agent-skills bank — minimal Python implementation (proof of spec v0.2)",
+    )
+    parser.add_argument("--bank-dir", help="override bank state directory")
+    parser.add_argument("--json", action="store_true", help="emit JSON output")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_sync = sub.add_parser("sync", help="fetch + embed + index a pack")
+    p_sync.add_argument("source", help="<host>/<owner>/<repo>[@<ref>]")
+
+    p_query = sub.add_parser("query", help="embed intent + cosine search")
+    p_query.add_argument("intent")
+    p_query.add_argument("--k", type=int, default=5)
+
+    p_bench = sub.add_parser("bench", help="run JSONL/JSON truth file")
+    p_bench.add_argument("truth_file")
+    p_bench.add_argument("--k", type=int, default=5)
+
+    args = parser.parse_args()
+    root = Path(args.bank_dir) if args.bank_dir else bank_root()
+
+    embedder = Embedder.ollama()
+
+    if args.cmd == "sync":
+        result = cmd_sync(args.source, embedder, root)
+    elif args.cmd == "query":
+        result = cmd_query(args.intent, args.k, embedder, root)
+    elif args.cmd == "bench":
+        result = cmd_bench(args.truth_file, args.k, embedder, root)
+    else:
+        parser.print_help()
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        _print_human(args.cmd, result)
+    if args.cmd == "bench" and result.get("failures"):
+        return 1
+    return 0
+
+
+def _print_human(cmd: str, r: dict[str, Any]) -> None:
+    """ASCII output to avoid console-encoding issues on Windows cp1252.
+    For Unicode glyphs in your terminal, use --json + jq."""
+    if cmd == "sync":
+        print(f"Synced {r['source']}")
+        print(f"  ref: {r['ref_requested']} -> {r['ref_resolved']}")
+        print(f"  total: {r['total']} | synced: {r['synced']} | invalid: {r['invalid']} | errored: {r['errored']}")
+        for s in r["skills"]:
+            icon = "[ok]" if s["status"] == "synced" else ("[invalid]" if s["status"] == "invalid" else "[err]")
+            print(f"  {icon} {s['id']}")
+    elif cmd == "query":
+        print(f"Top {len(r['hits'])} skills for: \"{r['intent']}\"")
+        print(f"  model: {r['embedding_model']}\n")
+        for i, h in enumerate(r["hits"], start=1):
+            print(f"  {i}. [{h['score']:.3f}] {h['identity']}")
+            print(f"      {h['title']}")
+    elif cmd == "bench":
+        n = r["total"]
+        pct = lambda x: f"{x/n*100:.1f}%" if n else "n/a"
+        print(f"Bench against {n} queries")
+        print(f"  truth: {r['truth_file']}")
+        print(f"  model: {r['embedding_model']}")
+        print(f"  top-1: {r['top1']}/{n} ({pct(r['top1'])})")
+        print(f"  top-3: {r['top3']}/{n} ({pct(r['top3'])})")
+        print(f"  top-{r['k']}: {r['topK']}/{n} ({pct(r['topK'])})")
+        print(f"  mean top-1 score: {r['mean_top1_score']:.3f}")
+        print(f"  mean margin (top-1 -> top-2): +{r['mean_margin']:.3f}")
+        if r["failures"]:
+            print(f"\nFailures ({len(r['failures'])}):")
+            for f in r["failures"]:
+                rank = f["rank"] if f["rank"] is not None else f">{r['k']}"
+                exp_score = f["expected_score"] if f["expected_score"] is not None else "n/a"
+                print(f"  FAIL \"{f['intent']}\"")
+                print(f"      expected: {f['expected']} (rank {rank}, score {exp_score})")
+                print(f"      got:      {f['got_top1']} (score {f['top1_score']:.3f})")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
