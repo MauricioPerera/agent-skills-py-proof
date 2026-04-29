@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -440,6 +441,180 @@ def extract_sigstore_identity(pem_signature: str | None) -> dict[str, str] | Non
     if issuer is not None:
         out["issuer"] = issuer
     return out
+
+
+# ────────────────────────────────────────────────────────────────────
+# gitsign Rekor lookup hash — parity with TS CLI v0.17.1 (cms.ts)
+# ────────────────────────────────────────────────────────────────────
+# gitsign submits Rekor entries indexed by SHA-256 of the SignerInfo's
+# SignedAttrs "marshaled for verification" (RFC 5652 §5.4). The [0]
+# IMPLICIT signedAttrs are re-encoded with an explicit SET tag (0x31)
+# instead of the implicit context-specific [0] (0xa0) — same length,
+# same content, different outer tag byte. SHA-256 of those bytes is the
+# hash a Level 4 verifier uses to locate the corresponding Rekor entry
+# via /api/v1/index/retrieve. See SPEC §5.4.2 step 3.
+#
+# Validated structurally via the messageDigest invariant (RFC 5652 §11.2):
+# the messageDigest attribute INSIDE SignedAttrs equals SHA-256(payload).
+# Tests confirm this against the real sigstore/gitsign@v0.14.0 fixture
+# in cms.test.ts — Python output is byte-identical to TS by design.
+
+_PEM_CMS_OPEN_GITSIGN = "-----BEGIN SIGNED MESSAGE-----"
+_PEM_CMS_CLOSE_GITSIGN = "-----END SIGNED MESSAGE-----"
+_REKOR_PUBLIC_HOST = "https://rekor.sigstore.dev"
+
+
+def _extract_signed_attrs_bytes(pem_signature: str) -> bytes | None:
+    """Walk a CMS payload to its first SignerInfo's SignedAttrs and
+    return the raw inner bytes (the Attribute SEQUENCEs).
+
+    Mirrors TS extractSignedAttrsBytes (cms.ts internal helper). Returns
+    None on any malformed structure — callers treat extraction failure
+    as "not a recognisable Sigstore CMS payload".
+    """
+    start = pem_signature.find(_PEM_CMS_OPEN_GITSIGN)
+    if start < 0:
+        return None
+    end = pem_signature.find(_PEM_CMS_CLOSE_GITSIGN, start + len(_PEM_CMS_OPEN_GITSIGN))
+    if end < 0:
+        return None
+    b64 = re.sub(r"\s+", "", pem_signature[start + len(_PEM_CMS_OPEN_GITSIGN):end])
+    try:
+        der = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if not der:
+        return None
+
+    try:
+        # ContentInfo SEQUENCE -> skip OID -> [0] EXPLICIT -> SignedData SEQUENCE
+        ci_tag, ci_voff, _, _ = _read_tlv(der, 0)
+        if ci_tag != 0x30:
+            return None
+        off = ci_voff
+        _, _, _, oid_total = _read_tlv(der, off)
+        off += oid_total
+        ex_tag, ex_voff, _, _ = _read_tlv(der, off)
+        if ex_tag != 0xA0:
+            return None
+        sd_tag, sd_voff, sd_vlen, _ = _read_tlv(der, ex_voff)
+        if sd_tag != 0x30:
+            return None
+
+        # Walk SignedData children. SignerInfos is the LAST SET (tag 0x31)
+        # — the digestAlgorithms SET comes earlier. Take the last one.
+        p = sd_voff
+        sd_end = sd_voff + sd_vlen
+        signer_infos = None
+        while p < sd_end:
+            t_tag, t_voff, t_vlen, t_total = _read_tlv(der, p)
+            if t_tag == 0x31:
+                signer_infos = (t_voff, t_vlen)
+            p += t_total
+        if signer_infos is None:
+            return None
+
+        # First SignerInfo SEQUENCE inside the set.
+        si_tag, si_voff, si_vlen, _ = _read_tlv(der, signer_infos[0])
+        if si_tag != 0x30:
+            return None
+
+        # Walk SignerInfo children to find signedAttrs ([0] IMPLICIT, tag 0xa0).
+        # Order per RFC 5652 §5.3: version, sid, digestAlgorithm, signedAttrs?, ...
+        sip = si_voff
+        si_end = si_voff + si_vlen
+        while sip < si_end:
+            t_tag, t_voff, t_vlen, t_total = _read_tlv(der, sip)
+            if t_tag == 0xA0:
+                return der[t_voff:t_voff + t_vlen]
+            sip += t_total
+        return None
+    except Exception:
+        return None
+
+
+def _encode_der_length(n: int) -> bytes:
+    """DER-encode a length value per X.690 §8.1.3."""
+    if n < 128:
+        return bytes([n])
+    if n < 256:
+        return bytes([0x81, n])
+    if n < 65536:
+        return bytes([0x82, (n >> 8) & 0xFF, n & 0xFF])
+    if n < 16777216:
+        return bytes([0x83, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
+    return bytes([
+        0x84,
+        (n >> 24) & 0xFF,
+        (n >> 16) & 0xFF,
+        (n >> 8) & 0xFF,
+        n & 0xFF,
+    ])
+
+
+def compute_gitsign_rekor_lookup_hash(pem_signature: str | None) -> str | None:
+    """Compute the gitsign-flavor Rekor lookup hash for a CMS payload.
+
+    Returns lower-case hex SHA-256 of the SignerInfo's SignedAttrs
+    marshaled for verification (the [0]-tagged signedAttrs re-encoded
+    with the SET tag 0x31, length and content unchanged).
+
+    Use this hash to locate the corresponding Rekor entry via
+    `find_rekor_entry_by_hash` (or any other Rekor index/retrieve client).
+
+    Returns None if the input isn't a parseable Sigstore CMS payload or
+    the SignedAttrs aren't present. Cross-impl parity with TS
+    computeGitsignRekorLookupHash (cms.ts) — produces byte-identical
+    output on the same input.
+    """
+    if not pem_signature:
+        return None
+    inner = _extract_signed_attrs_bytes(pem_signature)
+    if inner is None:
+        return None
+    # Re-frame: SET tag (0x31) + DER-length + content bytes (unchanged).
+    reframed = bytes([0x31]) + _encode_der_length(len(inner)) + inner
+    return hashlib.sha256(reframed).hexdigest()
+
+
+def find_rekor_entry_by_hash(
+    hash_hex: str,
+    host: str = _REKOR_PUBLIC_HOST,
+    timeout: int = 30,
+) -> list[str]:
+    """Look up Rekor entry UUIDs by an artifact hash via
+    POST /api/v1/index/retrieve.
+
+    Returns a list of UUIDs (may be empty — no entry matches is NOT an
+    error; old or rotated Rekor shards may have pruned entries even
+    when the signing event was real).
+
+    `hash_hex` must be a 64-char lower-case hex SHA-256 (the function
+    does not accept a sha256: prefix; it adds one before sending).
+    Mirrors TS findRekorEntryByHash (rekor.ts).
+    """
+    if not re.match(r"^[a-f0-9]{64}$", hash_hex):
+        raise ValueError(
+            f"rekor: hash must be 64-char lower-case hex SHA-256, got '{hash_hex}'",
+        )
+    url = f"{host}/api/v1/index/retrieve"
+    r = requests.post(
+        url,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        json={"hash": f"sha256:{hash_hex}"},
+        timeout=timeout,
+    )
+    if not r.ok:
+        raise RuntimeError(
+            f"rekor: index/retrieve returned {r.status_code} {r.reason}",
+        )
+    data = r.json()
+    if not isinstance(data, list):
+        raise RuntimeError("rekor: index/retrieve did not return an array")
+    for u in data:
+        if not isinstance(u, str):
+            raise RuntimeError("rekor: index/retrieve array contains non-string")
+    return data
 
 
 def verify_github_tag(repo: str, ref: str) -> dict[str, Any]:
